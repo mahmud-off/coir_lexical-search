@@ -22,6 +22,46 @@ class DenseRetrievalExactSearch(BaseSearch):
         self.convert_to_tensor = kwargs.get("convert_to_tensor", True)
         self.results = {}
     
+    def lexical_search(self, 
+                       corpus: Dict[str, Dict[str, str]], 
+                       queries: Dict[str, str], 
+                       top_k: int,  
+                       **kwargs) -> Dict[str, Dict[str, float]]:
+        
+        query_ids = list(queries.keys())
+        self.results = {qid: {} for qid in query_ids}
+        queries = [queries[qid] for qid in queries] # запросы текстом
+        
+        corpus_ids = sorted(corpus, key=lambda k: len(corpus[k].get("title", "") + corpus[k].get("text", "")), reverse=True)
+        corpus = [corpus[cid] for cid in corpus_ids]
+
+        docs = [doc['text'] for doc in corpus] #документы текстом
+
+        result_heaps = {qid: [] for qid in query_ids}  # Keep only the top-k docs for each query
+        for query_iter in range(len(queries)):
+            query_id = query_ids[query_iter]
+            q_set = set(queries[query_iter].split())
+            for doc_itr in range(len(docs)):
+                corpus_id = corpus_ids[doc_itr]
+                d_set = set(docs[doc_itr].split())
+                intersection = len(q_set.intersection(d_set))
+                union = len(q_set.union(d_set))
+                score = intersection / union if union > 0 else 0.0 # рассчёт score!!! (0 <= score <=1)
+                if corpus_id != query_id:
+                        if len(result_heaps[query_id]) < top_k:
+                            # Push item on the heap
+                            heapq.heappush(result_heaps[query_id], (score, corpus_id))
+                        else:
+                            # If item is larger than the smallest in the heap, push it on the heap then pop the smallest element
+                            heapq.heappushpop(result_heaps[query_id], (score, corpus_id))
+
+        for qid in result_heaps:
+            for score, corpus_id in result_heaps[qid]:
+                self.results[qid][corpus_id] = score  
+
+        return self.results       
+
+
     def search(self, 
                corpus: Dict[str, Dict[str, str]], 
                queries: Dict[str, str], 

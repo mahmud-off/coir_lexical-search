@@ -10,3 +10,11 @@ class BaseSearch(ABC):
                top_k: int, 
                **kwargs) -> Dict[str, Dict[str, float]]:
         pass
+
+    @abstractmethod
+    def lexical_search(self, 
+               corpus: Dict[str, Dict[str, str]], 
+               queries: Dict[str, str], 
+               top_k: int, 
+               **kwargs) -> Dict[str, Dict[str, float]]:
+        pass
