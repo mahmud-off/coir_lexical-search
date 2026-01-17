@@ -17,7 +17,7 @@ class EvaluateRetrieval:
     def retrieve(self, corpus: Dict[str, Dict[str, str]], queries: Dict[str, str], **kwargs) -> Dict[str, Dict[str, float]]:
         if not self.retriever:
             raise ValueError("Model/Technique has not been provided!")
-        return self.retriever.lexical_search(corpus, queries, self.top_k)
+        return self.retriever.hibrid_search(corpus, queries, self.top_k, self.score_function, **kwargs)
     
     def rerank(self, 
             corpus: Dict[str, Dict[str, str]], 

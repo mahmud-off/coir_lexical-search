@@ -22,6 +22,8 @@ class DenseRetrievalExactSearch(BaseSearch):
         self.convert_to_tensor = kwargs.get("convert_to_tensor", True)
         self.results = {}
     
+  # MY CODE START
+
     def lexical_search(self, 
                        corpus: Dict[str, Dict[str, str]], 
                        queries: Dict[str, str], 
@@ -57,10 +59,11 @@ class DenseRetrievalExactSearch(BaseSearch):
 
         for qid in result_heaps:
             for score, corpus_id in result_heaps[qid]:
-                self.results[qid][corpus_id] = score  
+                self.results[qid][corpus_id] = score 
 
         return self.results       
 
+  # MY CODE END
 
     def search(self, 
                corpus: Dict[str, Dict[str, str]], 
@@ -129,5 +132,174 @@ class DenseRetrievalExactSearch(BaseSearch):
         for qid in result_heaps:
             for score, corpus_id in result_heaps[qid]:
                 self.results[qid][corpus_id] = score
+                
         
         return self.results 
+
+# MY CODE START
+
+    def lexical_search_fh(self, 
+                       corpus: Dict[str, Dict[str, str]], 
+                       queries: Dict[str, str], 
+                       top_k: int,  
+                       **kwargs):
+        
+        query_ids = list(queries.keys())
+        self.results = {qid: {} for qid in query_ids}
+        queries = [queries[qid] for qid in queries] # запросы текстом
+        
+        corpus_ids = sorted(corpus, key=lambda k: len(corpus[k].get("title", "") + corpus[k].get("text", "")), reverse=True)
+        corpus = [corpus[cid] for cid in corpus_ids]
+
+        docs = [doc['text'] for doc in corpus] #документы текстом
+
+        result_heaps = {qid: [] for qid in query_ids}  # Keep only the top-k docs for each query
+        for query_iter in range(len(queries)):
+            query_id = query_ids[query_iter]
+            q_set = set(queries[query_iter].split())
+            for doc_itr in range(len(docs)):
+                corpus_id = corpus_ids[doc_itr]
+                d_set = set(docs[doc_itr].split())
+                intersection = len(q_set.intersection(d_set))
+                union = len(q_set.union(d_set))
+                score = intersection / union if union > 0 else 0.0 # рассчёт score!!! (0 <= score <=1)
+                if corpus_id != query_id:
+                        if len(result_heaps[query_id]) < top_k:
+                            # Push item on the heap
+                            heapq.heappush(result_heaps[query_id], (score, corpus_id))
+                        else:
+                            # If item is larger than the smallest in the heap, push it on the heap then pop the smallest element
+                            heapq.heappushpop(result_heaps[query_id], (score, corpus_id))
+
+        return result_heaps       
+
+    def search_fh(self, 
+               corpus: Dict[str, Dict[str, str]], 
+               queries: Dict[str, str], 
+               top_k: int, 
+               score_function: str,
+               return_sorted: bool = False, 
+               **kwargs):
+        # Create embeddings for all queries using model.encode_queries()
+        # Runs semantic search against the corpus embeddings
+        # Returns a ranked list with the corpus ids
+        if score_function not in self.score_functions:
+            raise ValueError("score function: {} must be either (cos_sim) for cosine similarity or (dot) for dot product".format(score_function))
+            
+        logger.info("Encoding Queries...")
+        query_ids = list(queries.keys())
+        self.results = {qid: {} for qid in query_ids}
+        queries = [queries[qid] for qid in queries]
+        query_embeddings = self.model.encode_queries(
+            queries, batch_size=self.batch_size, show_progress_bar=self.show_progress_bar, convert_to_tensor=self.convert_to_tensor)
+          
+        logger.info("Sorting Corpus by document length (Longest first)...")
+
+        corpus_ids = sorted(corpus, key=lambda k: len(corpus[k].get("title", "") + corpus[k].get("text", "")), reverse=True)
+        corpus = [corpus[cid] for cid in corpus_ids]
+
+        logger.info("Encoding Corpus in batches... Warning: This might take a while!")
+        logger.info("Scoring Function: {} ({})".format(self.score_function_desc[score_function], score_function))
+
+        itr = range(0, len(corpus), self.corpus_chunk_size)
+        
+        result_heaps = {qid: [] for qid in query_ids}  # Keep only the top-k docs for each query
+        for batch_num, corpus_start_idx in enumerate(itr):
+            logger.info("Encoding Batch {}/{}...".format(batch_num+1, len(itr)))
+            corpus_end_idx = min(corpus_start_idx + self.corpus_chunk_size, len(corpus))
+
+            # Encode chunk of corpus    
+            sub_corpus_embeddings = self.model.encode_corpus(
+                corpus[corpus_start_idx:corpus_end_idx],
+                batch_size=self.batch_size,
+                show_progress_bar=self.show_progress_bar, 
+                convert_to_tensor = self.convert_to_tensor
+                )
+
+            # Compute similarites using either cosine-similarity or dot product
+            cos_scores = self.score_functions[score_function](query_embeddings, sub_corpus_embeddings)
+            cos_scores[torch.isnan(cos_scores)] = -1
+
+            # Get top-k values
+            cos_scores_top_k_values, cos_scores_top_k_idx = torch.topk(cos_scores, min(top_k+1, len(cos_scores[1])), dim=1, largest=True, sorted=return_sorted)
+            cos_scores_top_k_values = cos_scores_top_k_values.cpu().tolist()
+            cos_scores_top_k_idx = cos_scores_top_k_idx.cpu().tolist()
+            
+            for query_itr in range(len(query_embeddings)):
+                query_id = query_ids[query_itr]                  
+                for sub_corpus_id, score in zip(cos_scores_top_k_idx[query_itr], cos_scores_top_k_values[query_itr]):
+                    corpus_id = corpus_ids[corpus_start_idx+sub_corpus_id]
+                    if corpus_id != query_id:
+                        if len(result_heaps[query_id]) < top_k:
+                            # Push item on the heap
+                            heapq.heappush(result_heaps[query_id], (score, corpus_id))
+                        else:
+                            # If item is larger than the smallest in the heap, push it on the heap then pop the smallest element
+                            heapq.heappushpop(result_heaps[query_id], (score, corpus_id))                
+        
+        return result_heaps
+
+    def hibrid_search(self, 
+               corpus: Dict[str, Dict[str, str]], 
+               queries: Dict[str, str], 
+               top_k: int, 
+               score_function: str,
+               return_sorted: bool = False, 
+               **kwargs) -> Dict[str, Dict[str, float]]:
+        
+
+        lexical_result = self.lexical_search_fh(corpus, queries, top_k)
+
+        semantic_result = self.search_fh(corpus, queries, top_k, score_function, return_sorted, **kwargs)
+
+        #merge
+
+        for qid in lexical_result:
+            heapq.heapify_max(lexical_result[qid])
+            heapq.heapify_max(semantic_result[qid])
+            if top_k > len(lexical_result[qid]):
+                border = len(lexical_result[qid])
+            else:
+                border = top_k
+            count = 0
+            addedCorpusIds = []
+            f1 = 0
+            while count < border/10:
+                score, corpus_id = heapq.heappop_max(semantic_result[qid])
+                self.results[qid][corpus_id] = score
+                addedCorpusIds.append(corpus_id)
+                count+=1
+                f1 += 1
+            f2 = 0
+            while count < border:
+                score, corpus_id = heapq.heappop_max(lexical_result[qid])
+                if(corpus_id not in addedCorpusIds):
+                    self.results[qid][corpus_id] = score
+                    count+=1
+                    f2 += 1
+
+            print(f1, f2)
+        #for qid in lexical_result:           
+        #    for score, corpus_id in semantic_result[qid]:
+        #        if corpus_id in self.results[qid]:
+        #            if self.results[qid][corpus_id] < score:
+        #                self.results[qid][corpus_id] = score 
+        #        else:
+        #            self.results[qid][corpus_id] = score
+        #
+        #    for score, corpus_id in lexical_result[qid]:
+        #        if corpus_id in self.results[qid]:
+        #            if self.results[qid][corpus_id] < score:
+        #                self.results[qid][corpus_id] = score 
+        #        else:
+        #            self.results[qid][corpus_id] = score
+
+        return self.results
+
+            
+
+
+        
+
+
+# MY CODE END
