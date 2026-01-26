@@ -4,7 +4,7 @@ import logging
 import torch
 from typing import Dict
 import heapq
-
+import bm25s
 logger = logging.getLogger(__name__)
 
 # DenseRetrievalExactSearch is parent class for any dense model that can be used for retrieval
@@ -23,6 +23,37 @@ class DenseRetrievalExactSearch(BaseSearch):
         self.results = {}
     
   # MY CODE START
+
+    def lexical_search_bm25(self,
+                        corpus: Dict[str, Dict[str, str]],
+                        queries: Dict[str, str],
+                        top_k: int,
+                        **kwargs) -> Dict[str, Dict[str, float]]:
+
+        query_ids = list(queries.keys())
+        corpus_ids = sorted(corpus, key=lambda k: len(corpus[k].get("title", "") + corpus[k].get("text", "")), reverse=True)
+
+        corpus_texts = [corpus[cid].get("text", "") for cid in corpus_ids]
+
+        tokenized_corpus = bm25s.tokenize(corpus_texts, stopwords="en")
+
+        retriever = bm25s.BM25()
+        retriever.index(tokenized_corpus)
+
+        results = {qid: {} for qid in query_ids}
+        for qid, query_text in queries.items():
+
+            tokenized_query = bm25s.tokenize(query_text, stopwords="en")
+
+            if(len(corpus_texts) < top_k):
+                top_k = len(corpus_texts)
+            doc_indexes, scores = retriever.retrieve(tokenized_query, k=top_k)
+
+            for idx, score in zip(doc_indexes[0], scores[0]):
+                if corpus_ids[idx] != qid:
+                    results[qid][corpus_ids[idx]] = float(score)
+
+        return results
 
     def lexical_search(self, 
                        corpus: Dict[str, Dict[str, str]], 
@@ -239,7 +270,174 @@ class DenseRetrievalExactSearch(BaseSearch):
         
         return result_heaps
 
-    def hibrid_search(self, 
+    def _reciprocal_rank_fusion(self, semantic_results, lexical_results, top_k, k: int = 60):
+        """
+        RRF: score = 1/(rank + k) где k обычно 60
+        Чем выше ранг документа в обоих списках, тем выше итоговый скор
+        """
+        fused_results = {}
+        
+        for query_id in semantic_results.keys():
+            semantic_scores = semantic_results[query_id]
+            lexical_scores = lexical_results[query_id]
+            
+            semantic_ranked = sorted(semantic_scores.items(), key=lambda x: x[1], reverse=True)
+            lexical_ranked = sorted(lexical_scores.items(), key=lambda x: x[1], reverse=True)
+            
+            semantic_ranks = {}
+            lexical_ranks = {}
+            
+            for rank, (doc_id, _) in enumerate(semantic_ranked):
+                semantic_ranks[doc_id] = rank + 1 
+                
+            for rank, (doc_id, _) in enumerate(lexical_ranked):
+                lexical_ranks[doc_id] = rank + 1
+
+            all_docs = set(semantic_scores.keys()) | set(lexical_scores.keys())
+            rrf_scores = {}
+            
+            for doc_id in all_docs:
+                semantic_rank = semantic_ranks.get(doc_id, len(semantic_ranks) + k + 1)
+                lexical_rank = lexical_ranks.get(doc_id, len(lexical_ranks) + k + 1)
+                
+                rrf_score = 1.0 / (semantic_rank + k) + 1.0 / (lexical_rank + k)
+                rrf_scores[doc_id] = rrf_score
+            
+            sorted_docs = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+            fused_results[query_id] = dict(sorted_docs)
+        
+        return fused_results
+
+    def _weighted_score_fusion(self, semantic_results, lexical_results, top_k, alpha: float = 0.5):
+        """
+        Взвешенное среднее нормализованных скорингов
+        alpha: вес для семантического поиска (0-1)
+        """
+        fused_results = {}
+        
+        for query_id in semantic_results.keys():
+            semantic_scores = semantic_results[query_id]
+            lexical_scores = lexical_results[query_id]
+            
+            if semantic_scores:
+                sem_max = max(semantic_scores.values())
+                sem_min = min(semantic_scores.values())
+                if sem_max > sem_min:
+                    semantic_norm = {doc_id: (score - sem_min) / (sem_max - sem_min) 
+                                for doc_id, score in semantic_scores.items()}
+                else:
+                    semantic_norm = {doc_id: 1.0 for doc_id in semantic_scores.keys()}
+            else:
+                semantic_norm = {}
+                
+            if lexical_scores:
+                lex_max = max(lexical_scores.values())
+                lex_min = min(lexical_scores.values())
+                if lex_max > lex_min:
+                    lexical_norm = {doc_id: (score - lex_min) / (lex_max - lex_min) 
+                                for doc_id, score in lexical_scores.items()}
+                else:
+                    lexical_norm = {doc_id: 1.0 for doc_id in lexical_scores.keys()}
+            else:
+                lexical_norm = {}
+            
+            all_docs = set(semantic_norm.keys()) | set(lexical_norm.keys())
+            fused_scores = {}
+            
+            for doc_id in all_docs:
+                sem_score = semantic_norm.get(doc_id, 0.0)
+                lex_score = lexical_norm.get(doc_id, 0.0)
+                
+                fused_score = alpha * sem_score + (1 - alpha) * lex_score
+                fused_scores[doc_id] = fused_score
+            
+            sorted_docs = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+            fused_results[query_id] = dict(sorted_docs)
+        
+        return fused_results
+
+    def _score_interpolation(self, semantic_results, lexical_results, top_k, alpha: float = 0.5):
+        """
+        Линейная интерполяция скорингов
+        """
+        fused_results = {}
+        
+        for query_id in semantic_results.keys():
+            semantic_scores = semantic_results[query_id]
+            lexical_scores = lexical_results[query_id]
+            
+            all_docs = set(semantic_scores.keys()) | set(lexical_scores.keys())
+            fused_scores = {}
+            
+            for doc_id in all_docs:
+                sem_score = semantic_scores.get(doc_id, 0.0)
+                lex_score = lexical_scores.get(doc_id, 0.0)
+                
+                # Интерполяция
+                fused_score = alpha * sem_score + (1 - alpha) * lex_score
+                fused_scores[doc_id] = fused_score
+            
+            sorted_docs = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+            fused_results[query_id] = dict(sorted_docs)
+        
+        return fused_results
+
+    def _combMNZ_fusion(self, semantic_results, lexical_results, top_k):
+        """
+        CombMNZ: score = (sum of scores) * log(number of lists containing doc)
+        """
+        fused_results = {}
+        
+        for query_id in semantic_results.keys():
+            semantic_scores = semantic_results[query_id]
+            lexical_scores = lexical_results[query_id]
+            
+            # Нормализация z-score
+            all_sem_scores = list(semantic_scores.values())
+            all_lex_scores = list(lexical_scores.values())
+            
+            if all_sem_scores:
+                sem_mean = sum(all_sem_scores) / len(all_sem_scores)
+                sem_std = (sum((s - sem_mean) ** 2 for s in all_sem_scores) / len(all_sem_scores)) ** 0.5
+                if sem_std > 0:
+                    semantic_norm = {doc_id: (score - sem_mean) / sem_std 
+                                for doc_id, score in semantic_scores.items()}
+                else:
+                    semantic_norm = {doc_id: 0.0 for doc_id in semantic_scores.keys()}
+            else:
+                semantic_norm = {}
+                
+            if all_lex_scores:
+                lex_mean = sum(all_lex_scores) / len(all_lex_scores)
+                lex_std = (sum((s - lex_mean) ** 2 for s in all_lex_scores) / len(all_lex_scores)) ** 0.5
+                if lex_std > 0:
+                    lexical_norm = {doc_id: (score - lex_mean) / lex_std 
+                                for doc_id, score in lexical_scores.items()}
+                else:
+                    lexical_norm = {doc_id: 0.0 for doc_id in lexical_scores.keys()}
+            else:
+                lexical_norm = {}
+            
+            # CombMNZ
+            all_docs = set(semantic_norm.keys()) | set(lexical_norm.keys())
+            combmnz_scores = {}
+            
+            for doc_id in all_docs:
+                scores = []
+                if doc_id in semantic_norm:
+                    scores.append(semantic_norm[doc_id])
+                if doc_id in lexical_norm:
+                    scores.append(lexical_norm[doc_id])
+                
+                combmnz_score = sum(scores) * len(scores)  # sum * log(num_lists) но обычно просто num_lists
+                combmnz_scores[doc_id] = combmnz_score
+            
+            sorted_docs = sorted(combmnz_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+            fused_results[query_id] = dict(sorted_docs)
+        
+        return fused_results
+
+    def hibrid_search_with_bm25(self, 
                corpus: Dict[str, Dict[str, str]], 
                queries: Dict[str, str], 
                top_k: int, 
@@ -247,9 +445,44 @@ class DenseRetrievalExactSearch(BaseSearch):
                return_sorted: bool = False, 
                **kwargs) -> Dict[str, Dict[str, float]]:
         
+        fusion_method = "combMNZ"
+        alpha = 0.5
+
+        if len(queries) < top_k:
+            top_k = len(queries)
+            print("\n\n\nNew top_k:")
+            print(top_k)
+            print("\n\n\n")
+
+        semantic_result = self.search(corpus, queries, top_k, score_function, return_sorted, **kwargs)
+
+        lexical_result = self.lexical_search_bm25(corpus, queries, top_k)
+
+        # !!!DENCHIK!!! lexical_result rerank !!!DENCHIK!!!
+        # vstavlay suda.
+ 
+        if fusion_method == "rrf":
+            return self._reciprocal_rank_fusion(semantic_result, lexical_result, top_k)
+        elif fusion_method == "weighted":
+            return self._weighted_score_fusion(semantic_result, lexical_result, top_k, alpha)
+        elif fusion_method == "interpolation":
+            return self._score_interpolation(semantic_result, lexical_result, top_k, alpha)
+        elif fusion_method == "combMNZ":
+            return self._combMNZ_fusion(semantic_result, lexical_result, top_k)
+        else:
+            raise ValueError(f"Unknown fusion method: {fusion_method}")
+
+
+    def hibrid_search(self, 
+               corpus: Dict[str, Dict[str, str]], 
+               queries: Dict[str, str], 
+               top_k: int, 
+               score_function: str,
+               return_sorted: bool = False, 
+               **kwargs) -> Dict[str, Dict[str, float]]:
 
         lexical_result = self.lexical_search_fh(corpus, queries, top_k)
-
+        
         semantic_result = self.search_fh(corpus, queries, top_k, score_function, return_sorted, **kwargs)
 
         #merge
@@ -264,7 +497,7 @@ class DenseRetrievalExactSearch(BaseSearch):
             count = 0
             addedCorpusIds = []
             f1 = 0
-            while count < border/10:
+            while count < border/2:
                 score, corpus_id = heapq.heappop_max(semantic_result[qid])
                 self.results[qid][corpus_id] = score
                 addedCorpusIds.append(corpus_id)

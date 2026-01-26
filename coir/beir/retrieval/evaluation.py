@@ -13,11 +13,22 @@ class EvaluateRetrieval:
         self.top_k = max(k_values)
         self.retriever = retriever
         self.score_function = score_function
-            
+
+#MY CODE            
     def retrieve(self, corpus: Dict[str, Dict[str, str]], queries: Dict[str, str], **kwargs) -> Dict[str, Dict[str, float]]:
         if not self.retriever:
             raise ValueError("Model/Technique has not been provided!")
-        return self.retriever.hibrid_search(corpus, queries, self.top_k, self.score_function, **kwargs)
+        # BEIR semantic
+        #return self.retriever.search(corpus, queries, self.top_k, self.score_function, **kwargs)
+        # Jaccard lexical search
+        #return self.retriever.lexical_search(corpus, queries, self.top_k)
+        # Jaccard hibrid search (max_heap)
+        #return self.retriever.hibrid_search(corpus, queries, self.top_k, self.score_function, **kwargs)
+        # bm25 lexical search
+        #return self.retriever.lexical_search_bm25(corpus, queries, self.top_k)
+        # bm25 hibrid serach
+        return self.retriever.hibrid_search_with_bm25(corpus, queries, self.top_k, self.score_function, **kwargs)
+#MY CODE 
     
     def rerank(self, 
             corpus: Dict[str, Dict[str, str]], 
